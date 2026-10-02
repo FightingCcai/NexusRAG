@@ -24,6 +24,19 @@ from app.services.models.parsed_document import (
 logger = logging.getLogger(__name__)
 
 
+def _caption_already_in(text: str, caption: str) -> bool:
+    """Whether *caption* is already present in *text*.
+
+    Captions are written into the markdown as alt text, with ``[``/``]``
+    stripped because brackets would end the alt early. A chunk cut from that
+    markdown therefore already carries the caption — comparing with brackets
+    removed on both sides keeps the two forms equal.
+    """
+    if not caption:
+        return False
+    return re.sub(r"[\[\]]", "", caption) in re.sub(r"[\[\]]", "", text)
+
+
 class BaseDocumentParser(ABC):
     """Abstract base for all document parsers (Docling, Marker, …)."""
 
@@ -258,7 +271,11 @@ class BaseDocumentParser(ABC):
                 desc_parts = []
                 for img_id in chunk.image_refs:
                     img = img_by_id.get(img_id)
-                    if img and img.caption:
+                    if (
+                        img
+                        and img.caption
+                        and not _caption_already_in(chunk.content, img.caption)
+                    ):
                         desc_parts.append(
                             f"[Image on page {img.page_no}]: {img.caption}"
                         )

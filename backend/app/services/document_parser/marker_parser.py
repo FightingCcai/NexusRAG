@@ -155,8 +155,9 @@ class MarkerDocumentParser(BaseDocumentParser):
         rendered = converter(str(file_path))
         text, ext, marker_images = text_from_rendered(rendered)
 
-        # Extract and save images
-        images = self._save_marker_images(marker_images, document_id)
+        # Extract and save images, keyed by Marker's own image name
+        image_map = self._save_marker_images(marker_images, document_id)
+        images = list(image_map.values())
 
         # Caption images with LLM vision
         if settings.NEXUSRAG_ENABLE_IMAGE_CAPTIONING and images:
@@ -166,7 +167,7 @@ class MarkerDocumentParser(BaseDocumentParser):
         markdown = re.sub(r"\n\{(\d+)\}", "", text)
 
         # Update image references in markdown with served URLs
-        markdown = self._replace_image_refs_in_markdown(markdown, marker_images, images)
+        markdown = self._replace_image_refs_in_markdown(markdown, image_map)
 
         # Extract tables from markdown
         tables = self._extract_tables_from_markdown(markdown, document_id)
@@ -205,15 +206,22 @@ class MarkerDocumentParser(BaseDocumentParser):
         self,
         marker_images: dict,
         document_id: int,
-    ) -> list[ExtractedImage]:
-        """Save Marker-extracted images (PIL) to disk and create ExtractedImage list."""
+    ) -> dict[str, ExtractedImage]:
+        """Save Marker-extracted images (PIL) to disk.
+
+        Returns a mapping of Marker's image name (the key it uses in the
+        rendered markdown) to ``ExtractedImage``, so markdown references can be
+        rewritten by name. Pairing by list position would silently mis-map every
+        later image as soon as one is skipped — over
+        ``NEXUSRAG_MAX_IMAGES_PER_DOC`` or failing to save.
+        """
         if not marker_images or not settings.NEXUSRAG_ENABLE_IMAGE_EXTRACTION:
-            return []
+            return {}
 
         images_dir = self.output_dir / "images"
         images_dir.mkdir(parents=True, exist_ok=True)
 
-        images: list[ExtractedImage] = []
+        images: dict[str, ExtractedImage] = {}
         count = 0
 
         for filename, pil_image in marker_images.items():
@@ -231,10 +239,9 @@ class MarkerDocumentParser(BaseDocumentParser):
                 pil_image.save(str(image_path), format="PNG")
                 width, height = pil_image.size
 
-                # Try to extract page number from filename (e.g., "page_3_image_1.png")
                 page_no = self._extract_page_from_filename(filename)
 
-                images.append(ExtractedImage(
+                images[filename] = ExtractedImage(
                     image_id=image_id,
                     document_id=document_id,
                     page_no=page_no,
@@ -242,7 +249,7 @@ class MarkerDocumentParser(BaseDocumentParser):
                     caption="",
                     width=width,
                     height=height,
-                ))
+                )
                 count += 1
 
             except Exception as e:
@@ -254,32 +261,45 @@ class MarkerDocumentParser(BaseDocumentParser):
 
     @staticmethod
     def _extract_page_from_filename(filename: str) -> int:
-        """Try to extract page number from Marker image filenames."""
-        # Marker filenames are like: "{doc_name}_page_{N}_image_{M}.png"
+        """Extract the 1-based page number from a Marker image filename.
+
+        Marker names images after the block path (``BlockId.to_path()``), e.g.
+        ``_page_0_Picture_1.png``, whose page id is 0-based. Add 1 so image page
+        numbers line up with the 1-based numbering used for chunks — otherwise
+        no image ever matches its own page's chunk. Returns 0 (unknown) when the
+        name carries no page id.
+        """
         match = re.search(r"page[_-]?(\d+)", filename, re.IGNORECASE)
         if match:
-            return int(match.group(1))
+            return int(match.group(1)) + 1
         return 0
 
     def _replace_image_refs_in_markdown(
         self,
         markdown: str,
-        marker_images: dict,
-        images: list[ExtractedImage],
+        image_map: dict[str, ExtractedImage],
     ) -> str:
-        """Replace Marker image filenames in markdown with served URLs."""
-        if not marker_images or not images:
-            return markdown
+        """Rewrite Marker's image references to served URLs, captioned as alt text.
 
-        # Build mapping: original filename → served URL
-        # Marker images dict and our images list are in the same order
-        filenames = list(marker_images.keys())
-        for i, img in enumerate(images):
-            if i < len(filenames):
-                original_name = filenames[i]
-                served_url = f"/static/doc-images/kb_{self.workspace_id}/images/{img.image_id}.png"
-                # Replace in markdown: ![alt](original_name) → ![alt](served_url)
-                markdown = markdown.replace(f"]({original_name})", f"]({served_url})")
+        Marker emits ``![](<block path>.png)`` with an empty alt, which leaves
+        the image content invisible to retrieval. ``DoclingDocumentParser``
+        writes the caption into the alt instead; doing the same here means the
+        caption reaches the chunk text — Marker chunks are cut from this
+        markdown — even when page-based image→chunk matching finds nothing.
+        """
+        for original_name, img in image_map.items():
+            served_url = (
+                f"/static/doc-images/kb_{self.workspace_id}/images/{img.image_id}.png"
+            )
+            # Brackets would terminate the alt text early
+            safe_caption = " ".join(
+                (img.caption or "").replace("[", "").replace("]", "").split()
+            )
+            markdown = re.sub(
+                r"!\[[^\]]*\]\(" + re.escape(original_name) + r"\)",
+                lambda _m, cap=safe_caption, url=served_url: f"![{cap}]({url})",
+                markdown,
+            )
 
         return markdown
 
@@ -352,9 +372,11 @@ class MarkerDocumentParser(BaseDocumentParser):
         """Count pages from paginated markdown output."""
         if not markdown:
             return 0
-        # Marker uses 48 hyphens as page separator
-        separators = markdown.count(_PAGE_SEPARATOR)
-        return separators + 1  # pages = separators + 1
+        # Marker writes the page separator at the START of each page, so the
+        # fragment before the first separator is empty and is not a page.
+        pages = markdown.split(_PAGE_SEPARATOR)
+        offset = 1 if not pages[0].strip() else 0
+        return len(pages) - offset
 
     # ------------------------------------------------------------------
     # Chunking
@@ -378,8 +400,15 @@ class MarkerDocumentParser(BaseDocumentParser):
         chunks: list[EnrichedChunk] = []
         chunk_index = 0
 
+        # Marker writes the page separator at the START of each page, so
+        # ``pages[0]`` is the empty fragment before page 1 — a page's number is
+        # therefore the fragment index itself, not index + 1. Staying aligned
+        # with Marker's own page ids is what lets image page numbers (see
+        # _extract_page_from_filename) match their own page's chunks.
+        offset = 1 if not pages[0].strip() else 0
+
         for page_idx, page_text in enumerate(pages):
-            page_no = page_idx + 1
+            page_no = page_idx + 1 - offset
             page_text = page_text.strip()
             if not page_text:
                 continue
