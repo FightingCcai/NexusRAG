@@ -41,8 +41,14 @@ WORKDIR /app/backend
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
 
-# Copy pre-downloaded models from models stage
+# Copy pre-downloaded models from models stage.
+#
+# Surya's s3:// checkpoints (text detection, OCR-error detection) land in the
+# datalab cache, *not* the HuggingFace one — copying only ~/.cache/huggingface
+# leaves them to be fetched on first parse, where a slow link blows past the
+# 300s model-server health check and the parse fails instead of merely stalling.
 COPY --from=models /root/.cache/huggingface /root/.cache/huggingface
+COPY --from=models /root/.cache/datalab /root/.cache/datalab
 
 # Copy backend source
 COPY backend/ .
